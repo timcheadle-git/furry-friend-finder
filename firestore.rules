@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users: owner-only write, user read/write profile
+    match /users/{uid} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.auth.uid == uid;
+      allow update, delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Pets: owner-only write; basic info readable by authenticated users
+    match /pets/{petId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.resource.data.ownerUid == request.auth.uid;
+      allow update, delete: if request.auth != null && resource.data.ownerUid == request.auth.uid;
+
+      // Prevent clients from changing ownerUid on updates
+      function validOwner() {
+        return request.resource.data.ownerUid == resource.data.ownerUid || (resource == null && request.resource.data.ownerUid == request.auth.uid);
+      }
+      allow update: if request.auth != null && validOwner();
+    }
+
+    // Lost reports: any authenticated user can create a report; only reporter or admins can modify
+    match /lostReports/{reportId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.resource.data.reporterUid == request.auth.uid;
+      allow update, delete: if request.auth != null && (resource.data.reporterUid == request.auth.uid || request.auth.token.admin == true);
+    }
+
+    // Subscriptions/opt-ins: user-only
+    match /subscriptions/{subId} {
+      allow read, write: if request.auth != null && request.auth.uid == resource.data.userUid;
+      allow create: if request.auth != null && request.resource.data.userUid == request.auth.uid;
+    }
+
+    // Alerts: created by server (use admin SDK) or readable by recipient
+    match /alerts/{alertId} {
+      allow read: if request.auth != null && (resource.data.sentTo.hasAny([request.auth.uid]) || resource.data.ownerUid == request.auth.uid);
+      allow create: if false; // force server to write alerts via admin SDK (bypass rules)
+      allow update, delete: if request.auth != null && request.auth.token.admin == true;
+    }
+  }
+}
