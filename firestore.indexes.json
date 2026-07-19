@@ -9,13 +9,6 @@
       ]
     },
     {
-      "collectionGroup": "pets",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "ownerUid", "order": "ASCENDING" }
-      ]
-    },
-    {
       "collectionGroup": "lostReports",
       "queryScope": "COLLECTION",
       "fields": [
