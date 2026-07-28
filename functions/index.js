@@ -4,33 +4,39 @@ const admin = require('firebase-admin');
 
 admin.initializeApp();
 
-// Initialize Twilio client from environment variables (safer for v7+), with fallback to firebase functions config
+// Initialize Twilio client from environment variables (Secret Manager/params mount into process.env)
+// Do NOT rely on firebase functions.config() — that legacy Runtime Config is deprecated and will be removed.
 let twilioClient = null;
-const functionsV1 = (() => { try { return require('firebase-functions'); } catch (e) { return null; } })();
 let TWILIO_SID = process.env.TWILIO_SID || null;
 let TWILIO_TOKEN = process.env.TWILIO_TOKEN || null;
 let TWILIO_FROM = process.env.TWILIO_FROM || null;
-// Fallback to functions config if not provided via env
-if ((!TWILIO_SID || !TWILIO_TOKEN) && functionsV1) {
-  try {
-    const cfg = functionsV1.config();
-    if (cfg && cfg.twilio) {
-      TWILIO_SID = TWILIO_SID || cfg.twilio.sid || null;
-      TWILIO_TOKEN = TWILIO_TOKEN || cfg.twilio.token || null;
-      TWILIO_FROM = TWILIO_FROM || cfg.twilio.from || null;
+
+if (!TWILIO_SID || !TWILIO_TOKEN) {
+  console.log('Twilio credentials not found in process.env. Ensure secrets are set via Secret Manager and functions are declared with the secret names.');
+}
+// Lazy ensure Twilio client using env-mounted secrets (Secret Manager / params)
+async function ensureTwilioClient() {
+  if (twilioClient) return;
+  const sid = process.env.TWILIO_SID || TWILIO_SID;
+  const token = process.env.TWILIO_TOKEN || TWILIO_TOKEN;
+  const from = process.env.TWILIO_FROM || TWILIO_FROM;
+  TWILIO_SID = sid || TWILIO_SID;
+  TWILIO_TOKEN = token || TWILIO_TOKEN;
+  TWILIO_FROM = from || TWILIO_FROM;
+  if (TWILIO_SID && TWILIO_TOKEN) {
+    try {
+      const twilio = require('twilio');
+      twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+      console.log('Twilio client initialized at runtime (env)');
+    } catch (e) {
+      console.warn('Twilio client failed to initialize at runtime', e);
     }
-  } catch (e) {
-    // ignore
+  } else {
+    console.log('Twilio secrets not available in process.env');
   }
 }
-if (TWILIO_SID && TWILIO_TOKEN) {
-  try {
-    const twilio = require('twilio');
-    twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
-  } catch (e) {
-    console.warn('Twilio client failed to initialize', e);
-  }
-}
+// Log whether Twilio is configured at module load (do not print secrets)
+console.log('Twilio configured at module load (client present?):', !!twilioClient);
 
 // Initialize messaging client that supports different admin SDK versions
 let messagingClient = null;
@@ -50,17 +56,31 @@ try {
   }
 }
 
-// Helper: send FCM multicast in batches
+// Helper: send FCM in compatible batches (supports sendMulticast, sendAll, or per-token send)
 async function sendFcmTokens(tokens, payload) {
   if (!tokens || tokens.length === 0) return;
-  if (!messagingClient || !messagingClient.sendMulticast) {
-    console.warn('Messaging client not available or does not support sendMulticast');
+  if (!messagingClient) {
+    console.warn('Messaging client not available');
     return;
   }
   const batchSize = 500; // FCM limit
   for (let i = 0; i < tokens.length; i += batchSize) {
     const slice = tokens.slice(i, i + batchSize);
-    await messagingClient.sendMulticast({ tokens: slice, ...payload });
+    if (typeof messagingClient.sendMulticast === 'function') {
+      // Modern API: sendMulticast
+      await messagingClient.sendMulticast({ tokens: slice, ...payload });
+    } else if (typeof messagingClient.sendAll === 'function') {
+      // Alternative API: sendAll expects an array of messages
+      const messages = slice.map((t) => ({ token: t, notification: payload.notification, data: payload.data }));
+      await messagingClient.sendAll(messages);
+    } else if (typeof messagingClient.send === 'function') {
+      // Fallback: send each message individually (slower)
+      await Promise.all(slice.map((t) => messagingClient.send({ token: t, notification: payload.notification, data: payload.data }).catch((err) => {
+        console.error('FCM send failed', err);
+      })));
+    } else {
+      console.warn('Messaging client does not support sendMulticast/sendAll/send');
+    }
   }
 }
 
@@ -108,13 +128,28 @@ async function processLostReport(report, reportId) {
   }
 
   // Send SMS via Twilio if configured
-  if (twilioClient && smsRecipients.length) {
+  if (smsRecipients.length) {
+    console.log('SMS recipients:', smsRecipients);
+    // Ensure Twilio client is initialized using secrets mounted in process.env
+    await ensureTwilioClient();
     const from = TWILIO_FROM || 'Twilio';
-    for (const to of smsRecipients) {
-      try {
-        await twilioClient.messages.create({ body: messageText, from, to });
-      } catch (err) {
-        console.error('Twilio send failed', err);
+    if (!twilioClient) {
+      console.warn('Skipping SMS sends: Twilio client not configured');
+    } else {
+      for (const to of smsRecipients) {
+        try {
+          const resp = await twilioClient.messages.create({ body: messageText, from, to });
+          // Twilio response includes sid and status
+          console.log('Twilio send response', { to, sid: resp && resp.sid, status: resp && resp.status });
+        } catch (err) {
+          // Twilio error objects may contain status, code, message
+          console.error('Twilio send failed', {
+            to,
+            message: err && err.message,
+            code: err && err.code,
+            more: err && (err.more || err)
+          });
+        }
       }
     }
   }
@@ -139,7 +174,7 @@ async function processLostReport(report, reportId) {
 }
 
 // Trigger: on new lost report, notify subscribers (prototype: no geo-filtering)
-exports.onLostReportCreated = onDocumentCreated('lostReports/{reportId}', async (event) => {
+exports.onLostReportCreated = onDocumentCreated('lostReports/{reportId}', { secrets: ['TWILIO_SID','TWILIO_TOKEN','TWILIO_FROM'] }, async (event) => {
   const snap = event.data; // DocumentSnapshot
   const report = snap.data();
   const reportId = snap.id;
@@ -152,7 +187,7 @@ exports.testNotify = onRequest((req, res) => {
 });
 
 // HTTP endpoint to simulate a lost report (for emulator testing)
-exports.simulateLostReport = onRequest(async (req, res) => {
+exports.simulateLostReport = onRequest({ secrets: ['TWILIO_SID','TWILIO_TOKEN','TWILIO_FROM'] }, async (req, res) => {
   const sample = {
     petId: 'pet-test-1',
     reporterUid: 'user-test-1',
@@ -162,6 +197,28 @@ exports.simulateLostReport = onRequest(async (req, res) => {
   };
   const report = req.body && Object.keys(req.body).length ? req.body : sample;
   try {
+    // Build recipients similarly to processLostReport so we can debug who's targeted
+    const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
+    const subsSnap = await db.collection('subscriptions').where('optIn', '==', true).get();
+    const fcmTokens = [];
+    const smsRecipients = [];
+    for (const subDoc of subsSnap.docs) {
+      const sub = subDoc.data();
+      if (!sub.userUid) continue;
+      const userDoc = await db.collection('users').doc(sub.userUid).get();
+      if (!userDoc.exists) continue;
+      const user = userDoc.data();
+      if (Array.isArray(user.fcmTokens)) fcmTokens.push(...user.fcmTokens);
+      if (user.phone && sub.smsOptIn) smsRecipients.push(user.phone);
+    }
+
+    // If debug query param present, return recipients without sending
+    const debug = (req.query && req.query.debug) || (req.body && req.body.debug);
+    if (debug) {
+      console.log('simulateLostReport debug recipients', { fcmTokens, smsRecipients });
+      return res.json({ ok: true, recipients: { fcmTokens, smsRecipients } });
+    }
+
     const result = await processLostReport(report, 'simulated-' + Date.now());
     res.json({ ok: true, result });
   } catch (err) {
@@ -175,7 +232,8 @@ exports.createSampleData = onRequest(async (req, res) => {
   try {
     const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
     const now = new Date().toISOString();
-    await db.collection('users').doc('user-alice').set({ name: 'Alice Tester', email: 'alice@example.com', phone: '+15550001111', fcmTokens: ['fcm-token-abc'], createdAt: now });
+    // Do not insert placeholder FCM tokens in sample data to avoid invalid-token errors during testing.
+    await db.collection('users').doc('user-alice').set({ name: 'Alice Tester', email: 'alice@example.com', phone: '+15550001111', fcmTokens: [], createdAt: now });
     await db.collection('users').doc('user-bob').set({ name: 'Bob SMS', email: 'bob@example.com', phone: '+15550002222', createdAt: now });
     await db.collection('subscriptions').doc('sub-alice-1').set({ userUid: 'user-alice', optIn: true, smsOptIn: false, radiusKm: 5, location: { latitude: 40.12, longitude: -74.12 }, createdAt: now });
     await db.collection('subscriptions').doc('sub-bob-1').set({ userUid: 'user-bob', optIn: true, smsOptIn: true, radiusKm: 10, location: { latitude: 40.13, longitude: -74.13 }, createdAt: now });
