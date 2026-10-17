@@ -129,7 +129,8 @@ async function processLostReport(report, reportId) {
 
   // Send SMS via Twilio if configured
   if (smsRecipients.length) {
-    console.log('SMS recipients:', smsRecipients);
+    // Do not log phone numbers (personal data); log only the count.
+    console.log('SMS recipient count:', smsRecipients.length);
     // Ensure Twilio client is initialized using secrets mounted in process.env
     await ensureTwilioClient();
     const from = TWILIO_FROM || 'Twilio';
@@ -181,65 +182,72 @@ exports.onLostReportCreated = onDocumentCreated('lostReports/{reportId}', { secr
   await processLostReport(report, reportId);
 });
 
-// A simple HTTPS test endpoint
-exports.testNotify = onRequest((req, res) => {
-  res.send('Notification prototype is deployed');
-});
+// SECURITY: the three helpers below are for local emulator testing only.
+// They are public HTTPS endpoints (no sign-in required), and two of them can
+// read subscriber contact details, send SMS through Twilio, or write sample data.
+// They are only exported when running under the Firebase emulator, so they are
+// never deployed to production.
+if (process.env.FUNCTIONS_EMULATOR === 'true') {
+  // A simple HTTPS test endpoint
+  exports.testNotify = onRequest((req, res) => {
+    res.send('Notification prototype is deployed');
+  });
 
-// HTTP endpoint to simulate a lost report (for emulator testing)
-exports.simulateLostReport = onRequest({ secrets: ['TWILIO_SID','TWILIO_TOKEN','TWILIO_FROM'] }, async (req, res) => {
-  const sample = {
-    petId: 'pet-test-1',
-    reporterUid: 'user-test-1',
-    status: 'lost',
-    lastSeenLocation: { latitude: 40.12345, longitude: -74.12345, address: 'Test Park' },
-    reportedAt: new Date().toISOString()
-  };
-  const report = req.body && Object.keys(req.body).length ? req.body : sample;
-  try {
-    // Build recipients similarly to processLostReport so we can debug who's targeted
-    const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
-    const subsSnap = await db.collection('subscriptions').where('optIn', '==', true).get();
-    const fcmTokens = [];
-    const smsRecipients = [];
-    for (const subDoc of subsSnap.docs) {
-      const sub = subDoc.data();
-      if (!sub.userUid) continue;
-      const userDoc = await db.collection('users').doc(sub.userUid).get();
-      if (!userDoc.exists) continue;
-      const user = userDoc.data();
-      if (Array.isArray(user.fcmTokens)) fcmTokens.push(...user.fcmTokens);
-      if (user.phone && sub.smsOptIn) smsRecipients.push(user.phone);
+  // HTTP endpoint to simulate a lost report (for emulator testing)
+  exports.simulateLostReport = onRequest({ secrets: ['TWILIO_SID','TWILIO_TOKEN','TWILIO_FROM'] }, async (req, res) => {
+    const sample = {
+      petId: 'pet-test-1',
+      reporterUid: 'user-test-1',
+      status: 'lost',
+      lastSeenLocation: { latitude: 40.12345, longitude: -74.12345, address: 'Test Park' },
+      reportedAt: new Date().toISOString()
+    };
+    const report = req.body && Object.keys(req.body).length ? req.body : sample;
+    try {
+      // Build recipients similarly to processLostReport so we can debug who's targeted
+      const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
+      const subsSnap = await db.collection('subscriptions').where('optIn', '==', true).get();
+      const fcmTokens = [];
+      const smsRecipients = [];
+      for (const subDoc of subsSnap.docs) {
+        const sub = subDoc.data();
+        if (!sub.userUid) continue;
+        const userDoc = await db.collection('users').doc(sub.userUid).get();
+        if (!userDoc.exists) continue;
+        const user = userDoc.data();
+        if (Array.isArray(user.fcmTokens)) fcmTokens.push(...user.fcmTokens);
+        if (user.phone && sub.smsOptIn) smsRecipients.push(user.phone);
+      }
+
+      // If debug query param present, return recipients without sending
+      const debug = (req.query && req.query.debug) || (req.body && req.body.debug);
+      if (debug) {
+        console.log('simulateLostReport debug recipients', { fcmTokens, smsRecipients });
+        return res.json({ ok: true, recipients: { fcmTokens, smsRecipients } });
+      }
+
+      const result = await processLostReport(report, 'simulated-' + Date.now());
+      res.json({ ok: true, result });
+    } catch (err) {
+      console.error('simulateLostReport error', err);
+      res.status(500).json({ ok: false, error: err.message });
     }
+  });
 
-    // If debug query param present, return recipients without sending
-    const debug = (req.query && req.query.debug) || (req.body && req.body.debug);
-    if (debug) {
-      console.log('simulateLostReport debug recipients', { fcmTokens, smsRecipients });
-      return res.json({ ok: true, recipients: { fcmTokens, smsRecipients } });
+  // Admin-only helper to create sample users/subscriptions using Admin SDK (emulator testing)
+  exports.createSampleData = onRequest(async (req, res) => {
+    try {
+      const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
+      const now = new Date().toISOString();
+      // Do not insert placeholder FCM tokens in sample data to avoid invalid-token errors during testing.
+      await db.collection('users').doc('user-alice').set({ name: 'Alice Tester', email: 'alice@example.com', phone: '+15550001111', fcmTokens: [], createdAt: now });
+      await db.collection('users').doc('user-bob').set({ name: 'Bob SMS', email: 'bob@example.com', phone: '+15550002222', createdAt: now });
+      await db.collection('subscriptions').doc('sub-alice-1').set({ userUid: 'user-alice', optIn: true, smsOptIn: false, radiusKm: 5, location: { latitude: 40.12, longitude: -74.12 }, createdAt: now });
+      await db.collection('subscriptions').doc('sub-bob-1').set({ userUid: 'user-bob', optIn: true, smsOptIn: true, radiusKm: 10, location: { latitude: 40.13, longitude: -74.13 }, createdAt: now });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('createSampleData error', err);
+      res.status(500).json({ ok: false, error: err.message });
     }
-
-    const result = await processLostReport(report, 'simulated-' + Date.now());
-    res.json({ ok: true, result });
-  } catch (err) {
-    console.error('simulateLostReport error', err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// Admin-only helper to create sample users/subscriptions using Admin SDK (emulator testing)
-exports.createSampleData = onRequest(async (req, res) => {
-  try {
-    const db = (() => { try { return admin.firestore(); } catch (e) { return require('firebase-admin/firestore').getFirestore(); }})();
-    const now = new Date().toISOString();
-    // Do not insert placeholder FCM tokens in sample data to avoid invalid-token errors during testing.
-    await db.collection('users').doc('user-alice').set({ name: 'Alice Tester', email: 'alice@example.com', phone: '+15550001111', fcmTokens: [], createdAt: now });
-    await db.collection('users').doc('user-bob').set({ name: 'Bob SMS', email: 'bob@example.com', phone: '+15550002222', createdAt: now });
-    await db.collection('subscriptions').doc('sub-alice-1').set({ userUid: 'user-alice', optIn: true, smsOptIn: false, radiusKm: 5, location: { latitude: 40.12, longitude: -74.12 }, createdAt: now });
-    await db.collection('subscriptions').doc('sub-bob-1').set({ userUid: 'user-bob', optIn: true, smsOptIn: true, radiusKm: 10, location: { latitude: 40.13, longitude: -74.13 }, createdAt: now });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('createSampleData error', err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+  });
+}
